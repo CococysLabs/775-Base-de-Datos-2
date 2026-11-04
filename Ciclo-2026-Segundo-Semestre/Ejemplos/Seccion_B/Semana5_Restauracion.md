@@ -7,234 +7,16 @@ Guía práctica con un esquema sencillo de ventas: backup **completo**, **difere
 ---
 
 ## Índice
-
-1. [Esquema de ejemplo y datos de prueba](#1-esquema-de-ejemplo-y-datos-de-prueba)
-2. [Preparación: modelo de recuperación y carpetas](#2-preparación-modelo-de-recuperación-y-carpetas)
-3. [Comandos de backup](#3-comandos-de-backup)
-4. [Simulación de un desastre y restauración](#4-simulación-de-un-desastre-y-restauración)
-5. [Automatizar con SQL Server Agent (Jobs)](#5-automatizar-con-sql-server-agent-jobs)
-6. [Automatizar con el Programador de tareas de Windows](#6-automatizar-con-el-programador-de-tareas-de-windows)
-7. [Buenas prácticas](#7-buenas-prácticas)
+1. [Simulación de un desastre y restauración](#1-simulación-de-un-desastre-y-restauración)
+2. [Automatizar con SQL Server Agent (Jobs)](#2-automatizar-con-sql-server-agent-jobs)
+3. [Automatizar con el Programador de tareas de Windows](#3-automatizar-con-el-programador-de-tareas-de-windows)
+4. [Buenas prácticas](#4-buenas-prácticas)
 
 ---
 
-## 1. Esquema de ejemplo y datos de prueba
+## 1. Simulación de un desastre y restauración
 
-### 1.1 Crear la base de datos y las tablas
-
-```sql
-CREATE DATABASE [BD2S22026];
-GO
-
-USE [BD2S22026];
-GO
-
--- Clientes
-CREATE TABLE cliente (
-    id_cliente INT PRIMARY KEY,
-    nombre     VARCHAR(50) NOT NULL UNIQUE
-);
-
--- Productos
-CREATE TABLE productos (
-    id_producto INT PRIMARY KEY,
-    nombre      VARCHAR(100) NOT NULL UNIQUE
-);
-
--- Venta
-CREATE TABLE BD2S22026.dbo.venta (
-    id_venta   INT PRIMARY KEY IDENTITY,
-    id_cliente INT NOT NULL,
-    fecha      DATETIME NOT NULL
-);
-
--- Detalle de venta
-CREATE TABLE BD2S22026.dbo.detalle_venta (
-    id_detalle_venta INT PRIMARY KEY IDENTITY,
-    id_venta         INT NOT NULL,
-    id_producto      INT NOT NULL,
-    cantidad         INT NOT NULL,
-    sub_total        DECIMAL NOT NULL
-);
-
-ALTER TABLE BD2S22026.dbo.detalle_venta
-ADD CONSTRAINT fk_venta_detalle_venta
-    FOREIGN KEY (id_venta) REFERENCES venta(id_venta);
-
-ALTER TABLE BD2S22026.dbo.detalle_venta
-ADD CONSTRAINT fk_venta_detalle_producto
-    FOREIGN KEY (id_producto) REFERENCES productos(id_producto);
-GO
-```
-
-> **Observación:** `DECIMAL` sin precisión equivale a `DECIMAL(18,0)`, es decir, **sin decimales**. Para montos reales conviene usar `DECIMAL(10,2)`.
-
-### 1.2 Datos iniciales (antes del backup completo)
-
-```sql
-USE [BD2S22026];
-GO
-
-INSERT INTO cliente (id_cliente, nombre) VALUES
-(1, 'Ana López'),
-(2, 'Carlos Pérez');
-
-INSERT INTO productos (id_producto, nombre) VALUES
-(1, 'Teclado'),
-(2, 'Mouse'),
-(3, 'Monitor');
-
-INSERT INTO venta (id_cliente, fecha) VALUES (1, GETDATE());
-INSERT INTO detalle_venta (id_venta, id_producto, cantidad, sub_total) VALUES (1, 1, 2, 300);
-GO
-```
-
----
-
-## 2. Preparación: modelo de recuperación y carpetas
-
-### 2.1 Cambiar el modelo de recuperación a FULL
-
-Para poder hacer backups de **log de transacciones** (y restaurar a un punto en el tiempo), la base debe estar en modelo `FULL`:
-
-```sql
-USE master;
-GO
-
-ALTER DATABASE [BD2S22026] SET RECOVERY FULL;
-GO
-
--- Verificar
-SELECT name, recovery_model_desc
-FROM sys.databases
-WHERE name = 'BD2S22026';
-```
-
-### 2.2 Crear las carpetas de respaldo
-
-Desde el Símbolo del sistema (CMD) o PowerShell:
-
-```bat
-mkdir C:\Backups\BD2S22026\FULL
-mkdir C:\Backups\BD2S22026\DIFF
-mkdir C:\Backups\BD2S22026\LOG
-```
-
-> La cuenta de servicio de SQL Server (por ejemplo `NT Service\MSSQLSERVER`) debe tener permisos de **escritura** sobre `C:\Backups`.
-
----
-
-## 3. Comandos de backup
-
-### 3.1 Backup completo (FULL)
-
-Es la base de toda la cadena de respaldos. Debe existir antes que cualquier diferencial o log.
-
-```sql
-BACKUP DATABASE [BD2S22026]
-TO DISK = N'C:\Backups\BD2S22026\FULL\BD2S22026_FULL.bak'
-WITH
-    INIT,                -- sobrescribe el archivo si existe
-    NAME = N'BD2S22026 - Backup completo',
-    COMPRESSION,         -- (no disponible en Express)
-    CHECKSUM,
-    STATS = 10;
-GO
-```
-
-### 3.2 Agregar más datos y hacer un backup diferencial
-
-```sql
-USE [BD2S22026];
-GO
-
-INSERT INTO venta (id_cliente, fecha) VALUES (2, GETDATE());
-INSERT INTO detalle_venta (id_venta, id_producto, cantidad, sub_total) VALUES (2, 2, 1, 80);
-GO
-```
-
-```sql
-BACKUP DATABASE [BD2S22026]
-TO DISK = N'C:\Backups\BD2S22026\DIFF\BD2S22026_DIFF.bak'
-WITH
-    DIFFERENTIAL,        -- cambios desde el último FULL
-    INIT,
-    NAME = N'BD2S22026 - Backup diferencial',
-    COMPRESSION,
-    CHECKSUM,
-    STATS = 10;
-GO
-```
-
-### 3.3 Más cambios y backup del log de transacciones
-
-```sql
-USE [BD2S22026];
-GO
-
-INSERT INTO venta (id_cliente, fecha) VALUES (1, GETDATE());
-INSERT INTO detalle_venta (id_venta, id_producto, cantidad, sub_total) VALUES (3, 3, 1, 1500);
-GO
-```
-
-```sql
-BACKUP LOG [BD2S22026]
-TO DISK = N'C:\Backups\BD2S22026\LOG\BD2S22026_LOG_1.trn'
-WITH
-    INIT,
-    NAME = N'BD2S22026 - Backup de log 1',
-    COMPRESSION,
-    CHECKSUM,
-    STATS = 10;
-GO
-```
-
-### 3.4 Un cambio más y un segundo backup de log
-
-Guardamos la hora, la usaremos luego para restaurar a un punto en el tiempo:
-
-```sql
-SELECT GETDATE() AS hora_antes_del_error;   -- anótala, ej: 2026-10-27 10:15:00
-GO
-
--- Simulamos un error humano: se borran las ventas por accidente
-DELETE FROM detalle_venta;
-DELETE FROM venta;
-GO
-
-BACKUP LOG [BD2S22026]
-TO DISK = N'C:\Backups\BD2S22026\LOG\BD2S22026_LOG_2.trn'
-WITH INIT, COMPRESSION, CHECKSUM, STATS = 10;
-GO
-```
-
-### 3.5 Verificar los backups
-
-```sql
--- Verifica que el archivo sea legible
-RESTORE VERIFYONLY
-FROM DISK = N'C:\Backups\BD2S22026\FULL\BD2S22026_FULL.bak'
-WITH CHECKSUM;
-
--- Historial de backups realizados
-SELECT
-    database_name,
-    CASE type WHEN 'D' THEN 'FULL'
-              WHEN 'I' THEN 'DIFERENCIAL'
-              WHEN 'L' THEN 'LOG' END AS tipo,
-    backup_start_date,
-    backup_finish_date,
-    CAST(backup_size / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS size_mb
-FROM msdb.dbo.backupset
-WHERE database_name = 'BD2S22026'
-ORDER BY backup_start_date DESC;
-```
-
----
-
-## 4. Simulación de un desastre y restauración
-
-### 4.1 Orden de restauración
+### 1.1 Orden de restauración
 
 ```
 FULL  →  DIFERENCIAL (el último)  →  LOG 1  →  LOG 2 (hasta el punto deseado)
@@ -243,7 +25,7 @@ FULL  →  DIFERENCIAL (el último)  →  LOG 1  →  LOG 2 (hasta el punto dese
 - Todos los pasos intermedios usan `WITH NORECOVERY` (la base queda "en restauración").
 - El último paso usa `WITH RECOVERY` para dejarla en línea.
 
-### 4.2 (Opcional) Backup de la cola del log
+### 1.2 (Opcional) Backup de la cola del log
 
 Si la base todavía está accesible, conviene respaldar lo último que no se haya respaldado:
 
@@ -259,7 +41,7 @@ GO
 
 > Si usas este paso, la base ya queda en `RESTORING` y puedes continuar con el `RESTORE` sin tener que desconectar usuarios.
 
-### 4.3 Restauración **completa** (hasta el último log)
+### 1.3 Restauración **completa** (hasta el último log)
 
 ```sql
 USE master;
@@ -294,7 +76,7 @@ GO
 
 > En este caso las ventas **quedarían borradas**, porque el `DELETE` está dentro del log 2. Para recuperarlas usamos la restauración a un punto en el tiempo.
 
-### 4.4 Restauración a un **punto en el tiempo** (`STOPAT`)
+### 1.4 Restauración a un **punto en el tiempo** (`STOPAT`)
 
 Restauramos hasta justo antes del `DELETE` accidental:
 
@@ -321,7 +103,7 @@ WITH STOPAT = '2026-10-27 10:15:00',   -- hora anotada antes del error
 GO
 ```
 
-### 4.5 Verificar los datos restaurados
+### 1.5 Verificar los datos restaurados
 
 ```sql
 USE [BD2S22026];
@@ -333,7 +115,7 @@ SELECT * FROM venta;
 SELECT * FROM detalle_venta;
 ```
 
-### 4.6 Restaurar con otro nombre (sin pisar la base original)
+### 1.6 Restaurar con otro nombre (sin pisar la base original)
 
 Útil para recuperar datos puntuales o hacer pruebas:
 
@@ -355,11 +137,11 @@ WITH
 
 ---
 
-## 5. Automatizar con SQL Server Agent (Jobs)
+## 2. Automatizar con SQL Server Agent (Jobs)
 
 > SQL Server Agent **no está disponible en la edición Express**. Si usas Express, ve a la [sección 6](#6-automatizar-con-el-programador-de-tareas-de-windows).
 
-### 5.1 Plan de respaldo propuesto
+### 2.1 Plan de respaldo propuesto
 
 | Tipo | Frecuencia | Horario | Retención sugerida |
 |---|---|---|---|
@@ -367,11 +149,11 @@ WITH
 | DIFERENCIAL | Diario (lunes a sábado) | 01:00 | 1–2 semanas |
 | LOG | Cada 15 minutos | Todo el día | 3–7 días |
 
-### 5.2 Verificar que el Agent esté corriendo
+### 2.2 Verificar que el Agent esté corriendo
 
 En SSMS, en el Explorador de objetos, **SQL Server Agent** debe aparecer sin la flecha roja. Si está detenido: clic derecho → **Start**.
 
-### 5.3 Crear un Job desde la interfaz gráfica (SSMS)
+### 2.3 Crear un Job desde la interfaz gráfica (SSMS)
 
 1. Expande **SQL Server Agent** → clic derecho en **Jobs** → **New Job...**
 2. Pestaña **General**: Nombre = `Backup_FULL_BD2S22026`.
@@ -389,7 +171,7 @@ En SSMS, en el Explorador de objetos, **SQL Server Agent** debe aparecer sin la 
 6. **OK**. Probar con clic derecho sobre el job → **Start Job at Step...**
 7. Revisar el resultado en **View History**.
 
-### 5.4 Crear los Jobs con T-SQL
+### 2.4 Crear los Jobs con T-SQL
 
 Los nombres de archivo incluyen fecha y hora para **no sobrescribir** los backups anteriores.
 
@@ -517,7 +299,7 @@ EXEC dbo.sp_add_jobserver
 GO
 ```
 
-### 5.5 Probar y monitorear los Jobs
+### 2.5 Probar y monitorear los Jobs
 
 ```sql
 -- Ejecutar un job manualmente
@@ -536,7 +318,7 @@ WHERE h.step_id = 0
 ORDER BY h.run_date DESC, h.run_time DESC;
 ```
 
-### 5.6 Limpieza de backups antiguos
+### 2.6 Limpieza de backups antiguos
 
 Agrega un **segundo paso** al job FULL (tipo *Operating system (CmdExec)*) que borre archivos de más de 30 días:
 
@@ -547,11 +329,11 @@ forfiles /p "C:\Backups\BD2S22026" /s /m *.trn /d -30 /c "cmd /c del @path"
 
 ---
 
-## 6. Automatizar con el Programador de tareas de Windows
+## 3. Automatizar con el Programador de tareas de Windows
 
 Ideal para **SQL Server Express** (sin Agent) o cuando prefieres no usar jobs. Se usa la herramienta `sqlcmd` para ejecutar scripts T-SQL.
 
-### 6.1 Verificar que `sqlcmd` esté disponible
+### 3.1 Verificar que `sqlcmd` esté disponible
 
 ```bat
 sqlcmd -?
@@ -560,13 +342,13 @@ sqlcmd -?
 Si no se reconoce el comando, instala las *Command Line Utilities for SQL Server* o usa la ruta completa, por ejemplo:
 `"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\sqlcmd.exe"`
 
-### 6.2 Crear la carpeta de scripts
+### 3.2 Crear la carpeta de scripts
 
 ```bat
 mkdir C:\Backups\Scripts
 ```
 
-### 6.3 Scripts `.sql`
+### 3.3 Scripts `.sql`
 
 **`C:\Backups\Scripts\backup_full.sql`**
 
@@ -604,7 +386,7 @@ TO DISK = @archivo
 WITH CHECKSUM;
 ```
 
-### 6.4 Scripts `.bat` que llaman a `sqlcmd`
+### 3.4 Scripts `.bat` que llaman a `sqlcmd`
 
 **`C:\Backups\Scripts\backup_full.bat`**
 
@@ -638,7 +420,7 @@ Parámetros de `sqlcmd`:
 
 > Si usas autenticación SQL en lugar de Windows: `-U usuario -P contraseña` (evita dejar contraseñas en texto plano cuando sea posible).
 
-### 6.5 Crear las tareas desde la interfaz gráfica
+### 3.5 Crear las tareas desde la interfaz gráfica
 
 1. Abre **Programador de tareas** (`taskschd.msc`).
 2. Clic en **Crear tarea...** (no "tarea básica", para tener más opciones).
@@ -659,9 +441,9 @@ Parámetros de `sqlcmd`:
 7. **Aceptar**. Clic derecho sobre la tarea → **Ejecutar** para probarla.
 8. Verificar que se creó el archivo `.bak` y revisar `backup_full.log`.
 
-Repite el proceso para el diferencial (diario) y el log (ver 6.6).
+Repite el proceso para el diferencial (diario) y el log (ver 3.6).
 
-### 6.6 Crear las tareas desde la línea de comandos (`schtasks`)
+### 3.6 Crear las tareas desde la línea de comandos (`schtasks`)
 
 Ejecuta CMD **como administrador**:
 
@@ -697,7 +479,7 @@ schtasks /delete /tn "SQL_Backup_FULL_BD2S22026" /f
 
 > Si usas `SYSTEM`, asegúrate de que ese usuario tenga login en SQL Server (`NT AUTHORITY\SYSTEM`) con permiso de backup. Si no, usa una cuenta de dominio/local con ese permiso.
 
-### 6.7 Limpieza automática de backups antiguos
+### 3.7 Limpieza automática de backups antiguos
 
 **`C:\Backups\Scripts\limpiar_backups.bat`**
 
@@ -716,7 +498,7 @@ schtasks /create /tn "SQL_Limpieza_Backups" ^
 
 ---
 
-## 7. Buenas prácticas
+## 4. Buenas prácticas
 
 - **Regla 3-2-1:** 3 copias de los datos, en 2 tipos de medios distintos, 1 copia fuera del servidor (nube, otra sede).
 - **No guardes los backups en el mismo disco** que los archivos `.mdf`/`.ldf`.
